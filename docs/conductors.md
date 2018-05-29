@@ -261,9 +261,46 @@ Upon completion of this invocation, the conductor action is activated again. The
 
 On the other hand, if the _action_ field is not defined in the output of the conductor action, the conductor action invocation ends. The output for the conductor action invocation is either the value of the _params_ field in the output dictionary of the last secondary activation if defined (auto boxed if necessary) or if absent the complete output dictionary.
 
+### Static conductor sequences
+
+Compositions often contain a statically known sequences of actions. So far, the continuation returned by a conductor action provides only the next step in a sequence. This requires interleaving secondary conductor activations between each user action of the sequence, doubling the number of action invocations and increasing latency.
+
+If a composition contains such a static sequence of actions, the _action_ field of a continuation can be an array, rather than just a single string. Each string in the array should be a fully qualified name. Failure to specify a fully qualified name for any element in the array results in a parsing error that terminates the activation before the first action in the sequence is invoked.
+
+If there is no parsing error, the first component in the _action_ array is invoked on the _params_ dictionary if specified (auto boxed if necessary) or if not on the empty dictionary. The output of each component in the sequence is passed as input to the following component. Upon completion of the last component in the sequence, the conductor action is activated again. The input dictionary for this activation is a combination of the output dictionary for the last component action in the sequence, and the value of the _state_ field from the prior secondary conductor activation.
+
+If any component in the sequence returns an error dictionary, the conductor action is activated again with the error dictionary as input (merged with the value of the _state_ field from the prior secondary conductor activation), skipping the remaining components of the sequence.
+
+We can redefine _tripleAndIncrement_ from above as a new action in a source file `tripleAndIncrementSeq.js` using these static sequences:
+
+```javascript
+function main(params) {
+    let step = params.$step || 0
+    delete params.$step
+    switch (step) {
+        case 0: return { action: ['triple', 'increment'], params, state: { $step: 1 } }
+        case 1: return { params }
+    }
+}
+```
+
+We can then deploy this new _conductor_ action:
+
+```
+wsk action create tripleAndIncrementSeq tripleAndIncrementSeq.js -a conductor true
+```
+
+The above code shows how static sequences can eliminate steps in conductor actions. The steps remain the same in this definition - namely:
+
+- step 0: invoke the _triple_ action on the input dictionary,
+- step 1: invoke the _increment_ action on the output dictionary from step 1,
+- step 2: return the output dictionary from step 2.
+
+However, the transition from step 0 to step 1 no longer requires a secondary conductor activation.
+
 ## Limits
 
-There are limits on the number of component action activations and secondary conductor activations in a conductor action invocation. These limits are assessed globally, i.e., if some components of a conductor action invocation are themselves conductor actions, the limits apply to the combined counts of activations across all the conductor action invocations.
+There are limits on the number of component action activations and secondary conductor activations in a conductor action invocation. These limits are assessed globally, i.e., if some components of a conductor action invocation are themselves conductor actions, the limits apply to the combined counts of activations across all the conductor action invocations. If the _action_ field defines an array, each action of the array counts as a single component action activation.
 
 The maximum number _n_ of permitted component activations is equal to the maximum number of components in a sequence action. It is configured via the same configuration parameter. The maximum number of secondary conductor activations is _2n+1_.
 

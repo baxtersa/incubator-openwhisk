@@ -18,10 +18,12 @@
 package whisk.core.controller.actions
 
 import java.time.{Clock, Instant}
+import java.util.concurrent.atomic.AtomicReference
 
 import akka.actor.ActorSystem
 import akka.event.Logging.InfoLevel
 import spray.json._
+import DefaultJsonProtocol._
 import whisk.common.{Logging, LoggingMarkers, TransactionId}
 import whisk.common.tracing.WhiskTracerProvider
 import whisk.core.connector.ActivationMessage
@@ -63,6 +65,14 @@ protected[actions] trait PrimitiveActions {
 
   /** Database service to get activations. */
   protected val activationStore: ActivationStore
+
+  /** A method that knows how to invoke a single primitive action. */
+  protected[actions] def invokeAction(
+    user: Identity,
+    action: WhiskActionMetaData,
+    payload: Option[JsObject],
+    waitForResponse: Option[FiniteDuration],
+    cause: Option[ActivationId])(implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]]
 
   /** A method that knows how to invoke a sequence of actions. */
   protected[actions] def invokeSequence(
@@ -348,6 +358,27 @@ protected[actions] trait PrimitiveActions {
             case None =>
               // no next action, end composition execution, return to caller
               Future.successful(ActivationResponse(activation.response.statusCode, Some(params.getOrElse(result))))
+            case Some(JsArray(next)) =>
+              // action field contained an array of actions
+              next match {
+                case _ +: _ if session.accounting.components < actionSequenceLimit =>
+                  val fqns = next.map { fqn =>
+                    FullyQualifiedEntityName.resolveName(fqn, user.namespace.name)
+                  }
+
+                  if (fqns.forall {
+                        _.isDefined
+                      }) {
+                    invokeStaticSequence(user, fqns.flatten, payload, session)
+                  } else {
+                    // some actions in static sequence could not be resolved
+                    Future.successful(ActivationResponse.applicationError(compositionSequenceInvalid(next.toJson)))
+                  }
+                case _ +: _ =>
+                  Future.successful(ActivationResponse.applicationError(compositionIsTooLong))
+                case _ => // static sequence is an empty list of actions
+                  Future.successful(ActivationResponse.applicationError(compositionSequenceInvalid(next.toJson)))
+              }
             case Some(next) =>
               FullyQualifiedEntityName.resolveName(next, user.namespace.name) match {
                 case Some(fqn) if session.accounting.components < actionSequenceLimit =>
@@ -363,6 +394,120 @@ protected[actions] trait PrimitiveActions {
       }
     }
 
+  }
+
+  /**
+   * Invokes the components of a static sequence in a blocking fashion.
+   * Reinvokes the conductor action at the end of the sequence, passing as input the result of the last component.
+   *
+   * Keeps track of the dynamic session component count.
+   * @param user the user invoking the sequence
+   * @param fqns the components in the sequence
+   * @param params the payload passed to the first component in the sequence
+   * @param session the session object for this composition
+   * @param transid a transaction id for logging
+   */
+  private def invokeStaticSequence(user: Identity,
+                                   fqns: Vector[FullyQualifiedEntityName],
+                                   params: Option[JsObject],
+                                   session: Session)(implicit transid: TransactionId): Future[ActivationResponse] = {
+    val resources = fqns.map(fqn => Resource(fqn.path, Collection(Collection.ACTIONS), Some(fqn.name.asString)))
+    entitlementProvider
+      .check(user, Privilege.ACTIVATE, resources.toSet, noThrottle = true)
+      .flatMap { _ =>
+        // For each action in the sequence, fetch any of its associated parameters (including package or binding).
+        // We do this for all of the actions in the sequence even though it may be short circuited. This is to
+        // hide the latency of the fetches from the datastore and the parameter merging that has to occur. It
+        // may be desirable in the future to selectively speculate over a smaller number of components rather than
+        // the entire sequence.
+        //
+        // This action/parameter resolution is done in futures; the execution starts as soon as the first component
+        // is resolved.
+        val resolvedFutureActions = fqns.map { fqn =>
+          WhiskActionMetaData.resolveActionAndMergeParameters(entityStore, fqn)
+        }
+
+        val initialInput = Some(
+          params
+            .getOrElse(JsObject())
+            .fields
+            .getOrElse(WhiskActivation.paramsField, params.getOrElse(JsObject()))
+            .asJsObject)
+        // this holds the initial accounting, including the initial input boxed as an ActivationResponse
+        val initialAccounting = Future.successful {
+          StaticSequenceAccounting(session.accounting.components, ActivationResponse.payloadPlaceholder(initialInput))
+        }
+
+        // execute the actions in sequential blocking fashion
+        val accounting = resolvedFutureActions
+          .foldLeft(initialAccounting) { (accountingFuture, actionFuture) =>
+            accountingFuture.flatMap { accounting =>
+              if (session.accounting.components < actionSequenceLimit) {
+                invokeNextAction(user, actionFuture, accounting, session).flatMap { accounting =>
+                  if (!accounting.shortcircuit) {
+                    Future.successful(accounting)
+                  } else {
+                    // This shortcircuits the fold
+                    Future.failed(FailedStaticSequenceActivation(accounting))
+                  }
+                }
+              } else {
+                val updatedAccounting = accounting.fail(ActivationResponse.applicationError(compositionIsTooLong))
+                Future.failed(FailedStaticSequenceActivation(updatedAccounting))
+              }
+            }
+          }
+          .recoverWith {
+            case FailedStaticSequenceActivation(accounting) => Future.successful(accounting)
+          }
+
+        accounting.flatMap { finalAccounting =>
+          invokeConductor(
+            user,
+            payload = finalAccounting.previousResponse.get.result.map { _.asJsObject },
+            session = session)
+        }
+      }
+      .recover {
+        case err =>
+          // failed entitlement check
+          ActivationResponse.applicationError(compositionComponentNotAccessible(fqns.toString))
+      }
+  }
+
+  /**
+   * Invokes one component from a static sequence.
+   *
+   * @param user the subject
+   * @param futureAction the future which fetches the action to be invoked from the db
+   * @param accounting the state of the static sequence activation, contains the dynamic activation count, logs and payload for the next action
+   * @param session the session for the current activation
+   * @return a future which resolves with updated accounting for a static sequence, including the last result, duration, and activation ids
+   */
+  private def invokeNextAction(user: Identity,
+                               futureAction: Future[WhiskActionMetaData],
+                               accounting: StaticSequenceAccounting,
+                               session: Session)(implicit transid: TransactionId): Future[StaticSequenceAccounting] = {
+    futureAction.flatMap { next =>
+      // the previous response becomes input for the next action in the sequence;
+      // the accounting no longer needs to hold a reference to it once the action is
+      // invoked, so previousResponse.getAndSet(null) drops the reference at this point
+      // which prevents dragging the previous response for the lifetime of the next activation
+      val input = accounting.previousResponse.getAndSet(null).result.map {
+        _.asJsObject
+      }
+      val timeout = session.action.limits.timeout.duration + 1.minute
+      // invoke the action
+      val newResponse = invokeAction(user, next, input, Some(timeout), Some(session.activationId))
+
+      waitForActivation(user, session, newResponse).flatMap {
+        case Left(activationResponse) => // return error response
+          Future.failed(FailedStaticSequenceActivation(accounting))
+        case Right(activation) =>
+          session.accounting.components += 1
+          Future.successful(accounting.maybe(activation, session.accounting.components, actionSequenceLimit))
+      }
+    }
   }
 
   /**
@@ -609,3 +754,87 @@ protected[actions] trait PrimitiveActions {
   /** Max atomic action count allowed for sequences */
   private lazy val actionSequenceLimit = whiskConfig.actionSequenceLimit.toInt
 }
+
+protected[actions] case class StaticSequenceAccounting(atomicActionCnt: Int,
+                                                       previousResponse: AtomicReference[ActivationResponse],
+                                                       logs: Buffer[ActivationId],
+                                                       duration: Long = 0,
+                                                       shortcircuit: Boolean = false) {
+
+  /** The previous activation was successful. */
+  private def success(activation: WhiskActivation, newCnt: Int, shortcircuit: Boolean = false) = {
+    previousResponse.set(null)
+    StaticSequenceAccounting(
+      prev = this,
+      newCnt = newCnt,
+      shortcircuit = shortcircuit,
+      incrDuration = activation.duration,
+      newResponse = activation.response,
+      newActivationId = activation.activationId)
+  }
+
+  /** The previous activation failed (this is used when there is no activation record or an internal error). */
+  def fail(failureResponse: ActivationResponse) = {
+    require(!failureResponse.isSuccess)
+    copy(previousResponse = new AtomicReference(failureResponse), shortcircuit = true)
+  }
+
+  def maybe(activation: WhiskActivation, newCnt: Int, maxSequenceCnt: Int)(
+    implicit transid: TransactionId): StaticSequenceAccounting = {
+    // check conditions on payload that may lead to interrupting the execution of the sequence
+    //     short-circuit the execution of the sequence iff the payload contains an error field
+    //     and is the result of an action return, not the initial payload
+    val outputPayload = activation.response.result.map(_.asJsObject)
+    val payloadContent = outputPayload getOrElse JsObject.empty
+    val errorField = payloadContent.fields.get(ActivationResponse.ERROR_FIELD)
+    val withinComponentLimit = newCnt <= maxSequenceCnt
+
+    if (withinComponentLimit && errorField.isEmpty) {
+      success(activation, newCnt)
+    } else {
+      val nextActivation = if (!withinComponentLimit) {
+        // no error in the activation but the dynamic count of actions exceeds the threshold
+        // this is here as defensive code; the activation should not occur if its takes the
+        // count above its limit
+        val newResponse = ActivationResponse.applicationError(sequenceIsTooLong)
+        activation.copy(response = newResponse)
+      } else {
+        assert(errorField.isDefined)
+        activation
+      }
+
+      // there is an error field in the activation response. here, we treat this like success,
+      // in the sense of tallying up the accounting fields, but terminate the sequence early
+      success(nextActivation, newCnt, shortcircuit = true)
+    }
+  }
+}
+
+protected[actions] object StaticSequenceAccounting {
+
+  // constructor for successful invocations, or error'ing ones (where shortcircuit = true)
+  def apply(prev: StaticSequenceAccounting,
+            newCnt: Int,
+            incrDuration: Option[Long],
+            newResponse: ActivationResponse,
+            newActivationId: ActivationId,
+            shortcircuit: Boolean): StaticSequenceAccounting = {
+
+    // append log entry
+    prev.logs += newActivationId
+
+    StaticSequenceAccounting(
+      atomicActionCnt = newCnt,
+      previousResponse = new AtomicReference(newResponse),
+      logs = prev.logs,
+      duration = incrDuration map { prev.duration + _ } getOrElse { prev.duration },
+      shortcircuit = shortcircuit)
+  }
+
+  // constructor for initial payload
+  def apply(atomicActionCnt: Int, initialPayload: ActivationResponse): StaticSequenceAccounting = {
+    StaticSequenceAccounting(atomicActionCnt, new AtomicReference(initialPayload), Buffer.empty)
+  }
+}
+
+protected[actions] case class FailedStaticSequenceActivation(accouting: StaticSequenceAccounting) extends Throwable

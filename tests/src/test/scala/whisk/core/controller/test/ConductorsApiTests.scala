@@ -61,6 +61,7 @@ class ConductorsApiTests extends ControllerTestCommon with WhiskActionsApi {
   val echo = MakeName.next("echo")
   val conductor = MakeName.next("conductor")
   val step = MakeName.next("step")
+  val applicationError = MakeName.next("applicationError")
   val missing = MakeName.next("missingAction") // undefined
   val invalid = "invalid#Action" // invalid name
 
@@ -241,6 +242,155 @@ class ConductorsApiTests extends ControllerTestCommon with WhiskActionsApi {
     }
   }
 
+  it should "invoke a conductor action with static sequence" in {
+    implicit val tid = transid()
+    put(entityStore, WhiskAction(namespace, conductor, jsDefault("??"), annotations = Parameters("conductor", "true")))
+    put(entityStore, WhiskAction(namespace, step, jsDefault("??")))
+    put(entityStore, WhiskAction(namespace, applicationError, jsDefault("??")))
+
+    // dynamically invoke a singleton static sequence
+    Post(
+      s"$collectionPath/${conductor}?blocking=true",
+      JsObject("action" -> Vector(step).toJson, "params" -> JsObject("n" -> 1.toJson))) ~> Route.seal(routes(creds)) ~> check {
+      status should be(OK)
+      val response = responseAs[JsObject]
+      response.fields("response").asJsObject.fields("result") shouldBe JsObject("n" -> 2.toJson)
+      response.fields("logs").convertTo[JsArray].elements.size shouldBe 3
+      response.fields("duration") shouldBe (3 * duration).toJson
+    }
+
+    // dynamically invoke singleton static sequence with an error result
+    Post(s"$collectionPath/${conductor}?blocking=true", JsObject("action" -> Vector(step).toJson)) ~> Route.seal(
+      routes(creds)) ~> check {
+      status should not be (OK)
+      val response = responseAs[JsObject]
+      response.fields("response").asJsObject.fields("status") shouldBe "application error".toJson
+      response.fields("response").asJsObject.fields("result") shouldBe JsObject("error" -> "missing parameter".toJson)
+      response.fields("logs").convertTo[JsArray].elements.size shouldBe 3
+      response.fields("duration") shouldBe (3 * duration).toJson
+    }
+
+    // empty static sequence returns error result
+    Post(s"$collectionPath/${conductor}?blocking=true", JsObject("action" -> JsArray())) ~> Route.seal(routes(creds)) ~> check {
+      status should not be (OK)
+      val response = responseAs[JsObject]
+      response.fields("response").asJsObject.fields("status") shouldBe "application error".toJson
+      response.fields("response").asJsObject.fields("result") shouldBe JsObject(
+        "error" ->
+          "Failed to parse action names from json value [] during composition sequence.".toJson)
+      response.fields("logs").convertTo[JsArray].elements.size shouldBe 1
+      response.fields("duration") shouldBe (1 * duration).toJson
+    }
+
+    // dynamically invoke singleton static sequence, forwarding state
+    Post(
+      s"$collectionPath/${conductor}?blocking=true",
+      JsObject("action" -> Vector(step).toJson, "state" -> JsObject("witness" -> 42.toJson), "n" -> 1.toJson)) ~> Route
+      .seal(routes(creds)) ~> check {
+      status should be(OK)
+      val response = responseAs[JsObject]
+      response.fields("response").asJsObject.fields("result") shouldBe JsObject("n" -> 2.toJson, "witness" -> 42.toJson)
+      response.fields("logs").convertTo[JsArray].elements.size shouldBe 3
+      response.fields("duration") shouldBe (3 * duration).toJson
+    }
+
+    // dynamically invoke static sequence with a pair of steps, forwarding state
+    Post(
+      s"$collectionPath/${conductor}?blocking=true",
+      JsObject("action" -> Vector.fill(2)(step).toJson, "state" -> JsObject("witness" -> 42.toJson), "n" -> 1.toJson)) ~> Route
+      .seal(routes(creds)) ~> check {
+      status should be(OK)
+      val response = responseAs[JsObject]
+      response.fields("response").asJsObject.fields("result") shouldBe JsObject("n" -> 3.toJson, "witness" -> 42.toJson)
+      response.fields("logs").convertTo[JsArray].elements.size shouldBe 4
+      response.fields("duration") shouldBe (4 * duration).toJson
+    }
+
+    // dynamically invoke a static sequence with a pair of step actions
+    Post(
+      s"$collectionPath/${conductor}?blocking=true",
+      JsObject("action" -> Vector.fill(2)(step).toJson, "params" -> JsObject("n" -> 1.toJson))) ~> Route.seal(
+      routes(creds)) ~> check {
+      status should be(OK)
+      val response = responseAs[JsObject]
+      response.fields("response").asJsObject.fields("result") shouldBe JsObject("n" -> 3.toJson)
+      response.fields("logs").convertTo[JsArray].elements.size shouldBe 4
+      response.fields("duration") shouldBe (4 * duration).toJson
+    }
+
+    // three steps
+    Post(
+      s"$collectionPath/${conductor}?blocking=true",
+      JsObject("action" -> Vector.fill(3)(step).toJson, "params" -> JsObject("n" -> 1.toJson))) ~> Route.seal(
+      routes(creds)) ~> check {
+      status should be(OK)
+      val response = responseAs[JsObject]
+      response.fields("response").asJsObject.fields("result") shouldBe JsObject("n" -> 4.toJson)
+      response.fields("logs").convertTo[JsArray].elements.size shouldBe 5
+      response.fields("duration") shouldBe (5 * duration).toJson
+    }
+
+    // error in sequence should escape early
+    Post(
+      s"$collectionPath/$conductor?blocking=true",
+      JsObject("action" -> Vector(step, applicationError, step).toJson, "params" -> JsObject("n" -> 1.toJson))) ~>
+      Route.seal(routes(creds)) ~> check {
+      status should not be (OK)
+      val response = responseAs[JsObject]
+      response.fields("response").asJsObject.fields("status") shouldBe "application error".toJson
+      response.fields("response").asJsObject.fields("result") shouldBe JsObject(
+        "error" ->
+          "This error thrown on purpose by the action.".toJson)
+      response.fields("logs").convertTo[JsArray].elements.size shouldBe 4
+      response.fields("duration") shouldBe (4 * duration).toJson
+    }
+
+    // invoke nested static sequence with single step
+    Post(
+      s"$collectionPath/${conductor}?blocking=true",
+      JsObject("action" -> conductor.toJson, "params" -> JsObject("action" -> Vector(step).toJson), "n" -> 1.toJson)) ~> Route
+      .seal(routes(creds)) ~> check {
+      status should be(OK)
+      val response = responseAs[JsObject]
+      response.fields("response").asJsObject.fields("result") shouldBe JsObject("n" -> 2.toJson)
+      response.fields("logs").convertTo[JsArray].elements.size shouldBe 3
+      response.fields("duration") shouldBe (5 * duration).toJson
+    }
+
+    // nested pair of steps followed by singleton outer step seq
+    Post(
+      s"$collectionPath/${conductor}?blocking=true",
+      JsObject(
+        "action" -> conductor.toJson,
+        "state" -> JsObject("action" -> Vector(step).toJson),
+        "params" -> JsObject("action" -> Vector.fill(2)(step).toJson),
+        "n" -> 1.toJson)) ~> Route.seal(routes(creds)) ~> check {
+      status should be(OK)
+      val response = responseAs[JsObject]
+      response.fields("response").asJsObject.fields("result") shouldBe JsObject("n" -> 4.toJson)
+      response.fields("logs").convertTo[JsArray].elements.size shouldBe 5
+      response.fields("duration") shouldBe (8 * duration).toJson
+    }
+
+    // two levels of nesting, three pairs steps
+    Post(
+      s"$collectionPath/${conductor}?blocking=true",
+      JsObject(
+        "action" -> conductor.toJson,
+        "state" -> JsObject("action" -> Vector.fill(2)(step).toJson),
+        "params" -> JsObject(
+          "action" -> conductor.toJson,
+          "state" -> JsObject("action" -> Vector.fill(2)(step).toJson),
+          "params" -> JsObject("action" -> Vector.fill(2)(step).toJson)),
+        "n" -> 1.toJson)) ~> Route.seal(routes(creds)) ~> check {
+      status should be(OK)
+      val response = responseAs[JsObject]
+      response.fields("response").asJsObject.fields("result") shouldBe JsObject("n" -> 7.toJson)
+      response.fields("logs").convertTo[JsArray].elements.size shouldBe 6
+      response.fields("duration") shouldBe (14 * duration).toJson
+    }
+  }
+
   it should "abort if composition is too long" in {
     implicit val tid = transid()
     put(entityStore, WhiskAction(namespace, conductor, jsDefault("??"), annotations = Parameters("conductor", "true")))
@@ -269,11 +419,45 @@ class ConductorsApiTests extends ControllerTestCommon with WhiskActionsApi {
       response.fields("response").asJsObject.fields("result") shouldBe JsObject("error" -> compositionIsTooLong.toJson)
     }
 
+    // static sequence stays just below the limit
+    Post(
+      s"$collectionPath/${conductor}?blocking=true",
+      JsObject("action" -> Vector.fill(limit)(step).toJson, "params" -> JsObject("n" -> 0.toJson))) ~> Route.seal(
+      routes(creds)) ~> check {
+      status should be(OK)
+      val response = responseAs[JsObject]
+      response.fields("response").asJsObject.fields("result") shouldBe JsObject("n" -> limit.toJson)
+      response.fields("duration") shouldBe (52 * duration).toJson
+    }
+
+    // add one extra step with static sequence
+    Post(
+      s"$collectionPath/${conductor}?blocking=true",
+      JsObject("action" -> Vector.fill(limit + 1)(step).toJson, "params" -> JsObject("n" -> 0.toJson))) ~> Route.seal(
+      routes(creds)) ~> check {
+      status should not be (OK)
+      val response = responseAs[JsObject]
+      response.fields("response").asJsObject.fields("status") shouldBe "application error".toJson
+      response.fields("response").asJsObject.fields("result") shouldBe JsObject("error" -> compositionIsTooLong.toJson)
+    }
+
     // nesting a composition at the limit should be ok
     Post(
       s"$collectionPath/${conductor}?blocking=true",
       JsObject("action" -> conductor.toJson, "params" -> JsObject(params), "n" -> 0.toJson)) ~> Route.seal(
       routes(creds)) ~> check {
+      status should be(OK)
+      val response = responseAs[JsObject]
+      response.fields("response").asJsObject.fields("result") shouldBe JsObject("n" -> limit.toJson)
+    }
+
+    // nesting a composition with a static sequence at the limit should be ok
+    Post(
+      s"$collectionPath/$conductor?blocking=true",
+      JsObject(
+        "action" -> conductor.toJson,
+        "params" -> JsObject("action" -> Vector.fill(limit)(step).toJson),
+        "n" -> 0.toJson)) ~> Route.seal(routes(creds)) ~> check {
       status should be(OK)
       val response = responseAs[JsObject]
       response.fields("response").asJsObject.fields("result") shouldBe JsObject("n" -> limit.toJson)
@@ -285,6 +469,19 @@ class ConductorsApiTests extends ControllerTestCommon with WhiskActionsApi {
       JsObject(
         "action" -> conductor.toJson,
         "params" -> JsObject("action" -> step.toJson, "state" -> JsObject(params)),
+        "n" -> 0.toJson)) ~> Route.seal(routes(creds)) ~> check {
+      status should not be (OK)
+      val response = responseAs[JsObject]
+      response.fields("response").asJsObject.fields("status") shouldBe "application error".toJson
+      response.fields("response").asJsObject.fields("result") shouldBe JsObject("error" -> compositionIsTooLong.toJson)
+    }
+
+    // nesting a composition with a static sequence beyond the limit should fail
+    Post(
+      s"$collectionPath/$conductor?blocking=true",
+      JsObject(
+        "action" -> conductor.toJson,
+        "params" -> JsObject("action" -> Vector.fill(limit + 1)(step).toJson),
         "n" -> 0.toJson)) ~> Route.seal(routes(creds)) ~> check {
       status should not be (OK)
       val response = responseAs[JsObject]
@@ -364,6 +561,9 @@ class ConductorsApiTests extends ControllerTestCommon with WhiskActionsApi {
               } getOrElse {
                 JsObject("error" -> "missing parameter".toJson)
               }
+              Future(Right(respond(action, msg, result)))
+            case `applicationError` => // see tests/dat/actions/applicationError.js
+              val result = JsObject("error" -> "This error thrown on purpose by the action.".toJson)
               Future(Right(respond(action, msg, result)))
             case _ =>
               Future.failed(new IllegalArgumentException("Unkown action invoked in conductor test"))

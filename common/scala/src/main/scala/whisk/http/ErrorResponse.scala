@@ -132,6 +132,10 @@ object Messages {
     s"Failed to resolve action with name '$name' during composition."
   def compositionComponentNotAccessible(name: String) =
     s"Failed entitlement check for action with name '$name' during composition."
+  def compositionSequenceInvalid(value: JsValue) =
+    s"Failed to parse action names from json value $value during composition sequence."
+  def compositionSequenceNotAccessible(value: JsValue) =
+    s"Failed entitlement check for actions in $value during composition sequence."
 
   /** Error messages for bad requests where parameters do not conform. */
   val parametersNotAllowed = "Request defines parameters that are not allowed (e.g., reserved properties)."

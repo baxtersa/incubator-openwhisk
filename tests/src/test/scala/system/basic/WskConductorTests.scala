@@ -118,6 +118,15 @@ class WskConductorTests extends TestHelpers with WskTestHelpers with JsHelpers w
           JsString(compositionComponentNotFound(s"$namespace/$missing")))
         checkConductorLogsAndAnnotations(activation, 1) // echo
       }
+
+      // an empty static sequence
+      val emptyrun = wsk.action.invoke(echo, Map("payload" -> testString.toJson, "action" -> JsArray()))
+      withActivation(wsk.activation, emptyrun) { activation =>
+        activation.response.status shouldBe "application error"
+        activation.response.result.get.fields.get("error") shouldBe Some(
+          JsString(compositionSequenceInvalid(JsArray())))
+        checkConductorLogsAndAnnotations(activation, 1) // echo
+      }
   }
 
   it should "invoke a conductor action with a continuation" in withAssetCleaner(wskprops) { (wp, assetHelper) =>
